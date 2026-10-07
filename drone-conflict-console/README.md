@@ -97,6 +97,24 @@
   非法参数拒绝；没有候选秒或确无安全起点时区间为空、最早起点为 `null`。修订
   上报后重查、批次重载后重查结果完全一致；批次页与 HTTP API 随
   `docker compose up` 一键启动即可访问。
+- **临时作业区预约**：在开工窗口中选定一个**整数秒起点 `s`**（连同圆柱范围、
+  非负当前秒 `t`、截止秒 `T` 与正整数时长 `d`）提交预约，页面与 HTTP API
+  返回**可重载的预约编号与状态**。提交裁决**全部在同一个
+  `BEGIN IMMEDIATE` 写事务内**完成：取得写锁后才从 SQLite 读取权威批次行、
+  **最新上报**与全部已登记预约，重新判定 `s ∈ [t, T-d]`、`t` 不早于任一已报
+  实际起飞、无逾期架次、闭作业区间 `[s, s+d]` 在连续时间上避开全部圆柱占用，
+  并且与同批次已登记预约**时空不相交**——两条预约的闭时间区间重叠（端点相触
+  也算）**且**闭圆柱重叠（水平圆心距 `≤ r1+r2`、高度带在同一平面相接都算）
+  才冲突，同柱错时、同时错柱均可登记。于是查询之后、提交之前另一进程落库的
+  **上报修订**（占用平移后撞上 `[s,s+d]`）会被事务内读到并拒绝，先提交的另一
+  条预约也会让后来者拿到赢家编号的 `reservation_conflict`；任何拒绝都回滚，
+  **不留任何记录**。非法参数 `400/422`、未知批次 `404`；逾期架次拒绝为
+  `409 overdue_unconfirmable`、撞占用为 `409 start_occupied`、撞预约为
+  `409 reservation_conflict`、`s` 越界为 `400 start_outside_window`。
+  **后续上报不会撤销预约**：列表/重载始终按 SQLite 最新状态重算每条预约的
+  状态——仍安全标 `safe`；可确认但被新占用或新预约撞上标 **`affected`（受
+  影响）**；出现逾期架次、或预约自身的 `t` 已早于某条已报实际起飞，标
+  **`unconfirmable`（不可确认）**。原预警、复盘与开工窗口响应保持不变。
 - **可视化对照**：
   - 水平航迹图（最早起飞虚线 / 求解后实线，冲突见证点用红色 ✕ 与安全圆标出）；
   - 甘特式时间轴（红色段为最早起飞时的冲突时间）；
@@ -118,7 +136,8 @@ drone-conflict-console/
 │   ├── solver.py        # OR-Tools CP-SAT 建模、字典序择优、无解核枚举
 │   ├── batch.py         # 批次预警纯逻辑：状态分类 + 连续时间冲突投影 + 复盘差分
 │   ├── workzone.py      # 临时作业区：连续时间圆柱占用 + 安全整数秒开工窗口
-│   ├── schemas.py       # 导入/求解/上报请求的校验
+│   ├── reservation.py   # 作业区预约：闭圆柱时空相交 + 提交重判 + 最新状态分级
+│   ├── schemas.py       # 导入/求解/上报/预约请求的校验
 │   ├── storage.py       # SQLite 持久化（场景、方案、批次、上报、复盘节点）
 │   └── static/          # 原生 JS + Canvas 前端（无构建步骤）
 ├── examples/crossroads.json
@@ -154,14 +173,27 @@ docker compose up --build
   阈值，显式确认后请求带 `use_stored_plan: true` 及一致的
   `confirmed_safety_radius/height`，才用旧表及原阈值冻结批次；省略确认
   会被服务端 `409` 拒绝且不建批次。
-- **批次页（含临时作业区开工窗口查询）**：<http://localhost:8000/>
+- **批次页（含临时作业区开工窗口查询与预约）**：<http://localhost:8000/>
   → 打开任意执行批次（或先从可行方案创建批次），在批次详情的
   **临时作业区开工窗口** 卡片填写圆柱参数、截止秒 `T` 与作业时长 `d`
-  （当前秒 `t` 沿用上方预警输入），点 **查询开工窗口**。
+  （当前秒 `t` 沿用上方预警输入），点 **查询开工窗口**；选定整数秒起点后
+  在同卡片的 **临时作业区预约** 中提交（也可点“填入最早安全起点”），下方
+  列表按最新上报实时标注每条预约为 ✅ 安全 / ⚠️ 受影响 / ⛔ 不可确认。
 - 作业区 HTTP API（批次 1 示例）：
   `http://localhost:8000/api/batches/1/workzone?cx=120&cy=0&radius=30&z_lo=15&z_hi=25&t=0&T=30&d=4`
+- 作业区预约 HTTP API（批次 1 示例）：
+  ```bash
+  curl -s -X POST http://localhost:8000/api/batches/1/workzone/reservations \
+    -H 'Content-Type: application/json' \
+    -d '{"cx":120,"cy":0,"radius":30,"z_lo":15,"z_hi":25,"t":0,"T":30,"d":4,"s":20}'
+  # => {"reservation":{"reservation_id":1,"batch_id":1,"start":20,
+  #                    "action_interval":[20,24],"status":"safe", ...}}
+  curl -s http://localhost:8000/api/batches/1/workzone/reservations       # 列表（最新状态）
+  curl -s http://localhost:8000/api/batches/1/workzone/reservations/1     # 按编号重载
+  ```
 - API 健康检查：<http://localhost:8000/api/health>
-- OpenAPI 文档（可选）：<http://localhost:8000/docs>（其中列出 `workzone` 接口）
+- OpenAPI 文档（可选）：<http://localhost:8000/docs>（其中列出 `workzone`
+  与 `workzone/reservations` 接口）
 
 命令行核对“超时 `unknown` + 旧表保留”契约（极小求解时限可强制 `unknown`）：
 
@@ -365,6 +397,15 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
      开工起点区间、被占用排除的开工秒，以及每架次航迹在圆柱内的连续时间
      占用区间（已裁剪到 `[t, T]`）。触及圆柱边界 / 航点 / 作业起止时刻均算
      占用。上报修订后再次查询会即时刷新，与 HTTP API 结果一致。
+   - 在同卡片的 **临时作业区预约** 中填写（或点“填入最早安全起点”）选定的
+     **整数秒起点 s** 后点 **预约该起点**：服务端在**同一个写事务**内按
+     SQLite 最新上报重新判定 `s∈[t,T−d]`、闭作业区间是否避开连续时间圆柱
+     占用，并排除同批次已登记预约的时空相交（时间或圆柱仅边界相触也算
+     冲突）；逾期架次或 `t` 早于已报实际起飞同样拒绝。被拒时弹出原因且
+     **不留记录**；成功则返回可重载的预约编号。下方列表在每次打开批次或
+     提交后刷新：后续上报**不撤销**预约，不再安全的标“⚠️ 受影响”（给出撞上
+     的占用架次/时间段或相交预约编号），逾期或 `t` 早于已报实际起飞的标
+     “⛔ 不可确认”，仍然安全的标“✅ 安全”。
 
 ---
 
@@ -461,6 +502,9 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `PUT` | `/api/batches/{id}/reports` | 上报某架次实际起飞偏移与修订号（幂等/冲突，多进程共库也按数据库级规则裁决） |
 | `GET` | `/api/batches/{id}/warning?t=` | 在非负当前秒 `t` 评估偏差预警 |
 | `GET` | `/api/batches/{id}/workzone?cx=&cy=&radius=&z_lo=&z_hi=&t=&T=&d=` | 临时圆柱作业区：返回 `[t,T-d]` 内安全整数秒开工起点区间与最早起点 |
+| `POST` | `/api/batches/{id}/workzone/reservations` | 预约一个整数秒开工起点；同一写事务内按最新上报重判占用/逾期并排除同批次预约时空相交，拒绝不留记录 |
+| `GET` | `/api/batches/{id}/workzone/reservations` | 列出本批次预约，状态按最新上报重算（safe/affected/unconfirmable） |
+| `GET` | `/api/batches/{id}/workzone/reservations/{rid}` | 按编号重载一条预约（可复核：编号、圆柱、t/T/d/s、最新状态） |
 | `GET` | `/api/batches/{id}/report-nodes` | 列出可复盘节点（基线 + 每次已接受的上报写入） |
 | `GET` | `/api/batches/{id}/report-nodes/{nid}/review?t=` | 用当前秒 `t` 复盘该节点前后的连续时间预警变化（未知节点/批次返回 404） |
 | `GET` | `/api/health` | 健康检查 |
@@ -943,6 +987,103 @@ curl -i "http://localhost:8000/api/batches/2/workzone?cx=120&cy=0&radius=30&z_lo
 响应不受影响。页面上在批次详情的 **临时作业区开工窗口** 卡片操作，结果与
 HTTP API 完全相同。
 
+### 8) 临时作业区预约（事务内按最新状态重判，拒绝不留记录）
+
+沿用 **批次 1**（`crossroads` 全新批次）与上一节的开工窗口查询：
+圆柱中心 `(120,0)`、半径 30 m、高度带 `[15,25]`，`t=0,T=30,d=4`，
+安全整数秒起点区间为 `[20,26]`、最早起点 20。从中选定起点 `s=20` 提交：
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/1/workzone/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"cx":120,"cy":0,"radius":30,"z_lo":15,"z_hi":25,"t":0,"T":30,"d":4,"s":20}'
+```
+
+```json
+{"reservation":{
+  "reservation_id":1,"batch_id":1,
+  "zone":{"center_x":120,"center_y":0,"radius":30,"z_lo":15,"z_hi":25},
+  "t":0,"T":30,"duration":4,"start":20,"action_interval":[20,24],
+  "status":"safe",
+  "overdue_sorties":[],"early_violations":[],
+  "occupancy_conflicts":[],"conflicting_reservation_ids":[]}}
+```
+
+列表与按编号重载返回同一结构，`status` 始终按**当时 SQLite 最新状态**重算：
+
+```bash
+curl -s http://localhost:8000/api/batches/1/workzone/reservations
+curl -s http://localhost:8000/api/batches/1/workzone/reservations/1
+```
+
+提交时的拒绝（全部在写事务内裁决并回滚，**不留预约记录**）：
+
+```bash
+# s 越出候选窗口 [t, T-d] = [0,26] -> 400 start_outside_window
+curl -i -X POST http://localhost:8000/api/batches/1/workzone/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"cx":120,"cy":0,"radius":30,"z_lo":15,"z_hi":25,"t":0,"T":30,"d":4,"s":27}'
+# HTTP/1.1 400 Bad Request
+# {"detail":{"reason":"start_outside_window","s":27,"t":0,"T":30,"duration":4,
+#            "candidate_window":{"start_lo":0,"start_hi":26,"has_candidates":true}}}
+
+# [s,s+d] 撞上连续时间航迹占用（含端点相触）-> 409 start_occupied，
+# detail.occupancy_conflicts 给出撞上的架次与相交时间段
+curl -i -X POST http://localhost:8000/api/batches/1/workzone/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"cx":120,"cy":0,"radius":30,"z_lo":15,"z_hi":25,"t":0,"T":30,"d":4,"s":10}'
+# HTTP/1.1 409 Conflict  {"detail":{"reason":"start_occupied",
+#   "s":10,"action_interval":[10,14],"occupancy_conflicts":[{"sortie_id":"UAV-A",...}]}}
+
+# 与预约 #1 时空相交：[20,24] 与 [24,28] 仅在端点 24 相触也算冲突，
+# 响应给出先提交的赢家编号 -> 409 reservation_conflict
+curl -i -X POST http://localhost:8000/api/batches/1/workzone/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"cx":120,"cy":0,"radius":30,"z_lo":15,"z_hi":25,"t":0,"T":30,"d":4,"s":24}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"reason":"reservation_conflict","s":24,"action_interval":[24,28],
+#            "conflicting_reservation_ids":[1]}}
+
+# 同柱错时（[25,29] 与 [20,24] 不相交）、同时错柱（水平圆心距 > r1+r2 或
+# 高度带不相交）均可登记：
+curl -s -X POST http://localhost:8000/api/batches/1/workzone/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"cx":120,"cy":0,"radius":30,"z_lo":15,"z_hi":25,"t":0,"T":30,"d":4,"s":25}'
+# => 201 reservation_id 2
+```
+
+**查询后上报修订不会放过过期起点**：提交裁决不在事务外预读——
+`Store.create_reservation` 在**同一个 `BEGIN IMMEDIATE` 事务**内读取权威批次行、
+最新上报与全部已登记预约（上报写入与预约写入争用同一把写锁），再依次重判
+`s∈[t,T-d]`、`t` 不早于已报实际起飞（`t_before_reported_takeoff`）、无逾期架次
+（`overdue_unconfirmable`）、连续时间占用（`start_occupied`）与同批次预约时空
+相交（`reservation_conflict`），全部通过才在该事务内插入并提交。因此查询时
+安全的起点若被“间隙中”提交的上报修订平移进占用，事务内读到的是修订后的
+航迹，照样 `409` 且不留记录；两条预约并发提交时写锁将其串行化，输家在
+事务内读到赢家行并拿到其编号。确定性持锁交错（一个进程持未提交写锁、
+强制另一进程的预约事务在其提交后才读到权威状态）见
+`tests/test_workzone_reservations.py` 的 `test_report_commits_in_gap` 与
+`test_two_reservations_race`。
+
+**后续上报不撤销预约，只改状态**。对批次 2（B 已上报实际 4）先登记一条在
+最新状态下安全的预约，再对 B 发更高修订号把占用平移进其作业区间：
+
+```bash
+# 列表中该预约由 safe 变为 affected，并给出撞上的占用；不删除、不回滚
+# {"reservation_id":...,"status":"affected",
+#  "occupancy_conflicts":[{"sortie_id":"UAV-B","status":"reported",
+#                          "takeoff_offset":16,
+#                          "occupied_intervals":[{"time_start":20,"time_end":22}]}],
+#  "conflicting_reservation_ids":[]}
+```
+
+再令某架次的已报实际起飞晚于预约自身的 `t`（或出现逾期架次），该预约变为
+`unconfirmable`（`early_violations` 给出 `{sortie_id, actual_takeoff}`，
+逾期时给 `overdue_sorties`）；纠正修订使占用离开后恢复 `safe`。
+非法参数（`radius<=0`、`z_lo>=z_hi`、`T<t`、`d<=0`、`t<0`）与越界 `s` 为
+`400/422`；未知批次 `404`、未知预约编号 `404`。预约接口不改变
+`/warning`、`/workzone` 与 `/report-nodes/.../review` 的既有响应。
+
 ---
 
 ## 测试
@@ -958,6 +1099,7 @@ python tests/test_solve_keeps_plan.py      # 路由/SQLite：超时 unknown 如�
 python tests/test_batch_solve_race.py      # 双进程共库：建批次与 /solve 交错的确定性裁决（unknown/新可行解/确证无解先提交、批次先提交），拒绝不留批次
 python tests/test_batches_warning.py       # 批次：修订协议/多进程共库并发/预警分类与冲突/复盘节点与区间差分
 python tests/test_workzone_window.py       # 作业区：圆柱占用解析几何 vs 密采样/闭区间相切/逾期与拒绝/安全窗口
+python tests/test_workzone_reservations.py # 作业区预约：参数拒绝/占用与时空相交（含边界相触）/最新状态分级/双进程持锁交错（间隙上报与并发预约）/拒绝不留记录
 ```
 
 - `test_geometry_crossval.py` 用三套相互独立的实现（多边形/椭圆柱解析、
@@ -980,6 +1122,15 @@ python tests/test_workzone_window.py       # 作业区：圆柱占用解析几�
   **逾期即不可确认且不提供安全起点**、`t` 早于已上报实际起飞整次拒绝、候选为空
   与确无安全起点均返回空区间/`null`、截止 `T` 裁剪，以及**修订纠正后重查与从
   SQLite 重载后重查逐字节一致**、既有预警响应结构不变。
+- `test_workzone_reservations.py` 验证预约的闭圆柱/闭时间相交规则（水平相切、
+  高度带共面、时间端点相触都算冲突；同柱错时、同时错柱均放行）、提交重判的
+  全部原因码（`start_outside_window`、`t_before_reported_takeoff`、
+  `overdue_unconfirmable`、`start_occupied`、`reservation_conflict`、
+  未知批次 404）且**任何拒绝都不留行**、最新状态分级（后续上报把占用平移进
+  作业区间标 `affected`、`t` 早于已报实际起飞/逾期标 `unconfirmable`、纠正后
+  恢复 `safe`）、删除批次级联清理，以及**双进程确定性持锁交错**：查询后
+  提交的间隙中落库的上报修订被事务内读到并拒绝过期起点、两条并发预约只留
+  赢家且输家拿到赢家编号。
 
 ---
 
@@ -1011,6 +1162,14 @@ python tests/test_workzone_window.py       # 作业区：圆柱占用解析几�
   安全，候选范围为整数秒 `[t, T-d]`（`T-d < t` 即无候选）。逾期架次存在时
   `confirmable=false` 且不返回安全起点；查询是冻结批次与已存上报的纯函数，
   修订重查与重载结果一致。
+- 作业区**预约**把一个整数秒起点连同圆柱、`t/T/d` 持久化为不可变行；提交时
+  在**同一个写事务**内按最新上报重判窗口归属、`t` 不早于已报实际起飞、无
+  逾期、闭作业区间 `[s,s+d]` 不与任何连续时间圆柱占用相交，并排除同批次已
+  登记预约的时空相交（闭时间区间重叠且闭圆柱重叠；时间端点、水平侧壁或高度
+  平面仅相触都算冲突）。间隙中提交的上报修订或先提交的预约因此不可能让过期
+  起点通过；拒绝全部回滚、不留记录。后续上报不撤销预约，列表按最新状态标
+  `safe` / `affected`（新占用或新预约撞上）/ `unconfirmable`（逾期，或预约的
+  `t` 早于已报实际起飞）。
 - 多个进程/副本可共用同一个 `DCC_DB_PATH` 指向的 SQLite 文件：数据库以 WAL 打开、
   设置了忙等待，上报用条件写入仲裁，并发修订不会回退；**建批次同样在写事务内读取
   权威状态并冻结快照**，与 `/solve` 交错时按提交顺序裁决（`unknown` 先提交则未选

@@ -102,3 +102,37 @@ class ReportRequest(BaseModel):
         ..., ge=0, description="actual take-off offset in seconds (non-negative)")
     revision: int = Field(
         ..., ge=1, description="report revision, 1 first then strictly increasing")
+
+
+class WorkZoneReservationRequest(BaseModel):
+    """One concrete work-zone start-second reservation.
+
+    The domain checks shared with the start-window query (positive radius,
+    z_lo < z_hi, non-negative t, T >= t, positive d) and the candidate-window
+    membership ``s ∈ [t, T-d]`` are re-adjudicated by the server against the
+    AUTHORITATIVE batch state inside the submission write transaction -
+    trusting client-side checks alone cannot be safe across processes.
+    """
+
+    cx: float
+    cy: float
+    radius: float = Field(..., gt=0)
+    z_lo: float
+    z_hi: float
+    t: int = Field(..., ge=0)
+    T: int = Field(..., description="deadline second (integer, >= t)")
+    d: int = Field(..., gt=0, description="positive integer action duration")
+    s: int = Field(..., ge=0,
+                   description="chosen integer start second in [t, T-d]")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.z_lo >= self.z_hi:
+            raise ValueError("z_lo must be strictly less than z_hi")
+        if self.T < self.t:
+            raise ValueError("deadline T must not be earlier than t")
+        if not (self.t <= self.s <= self.T - self.d):
+            raise ValueError(
+                f"start s must be an integer in [t, T-d] "
+                f"([{self.t}, {self.T - self.d}])")
+        return self

@@ -27,6 +27,7 @@ const state = {
   reviewNodes: [],       // accepted report nodes (incl. baseline) for the open batch
   review: null,          // last warning-change review result
   workzone: null,        // last temporary work-zone start-window result
+  reservations: null,    // registered work-zone reservations (live statuses)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -106,6 +107,7 @@ function loadScenarioDto(dto) {
   state.review = null;
   state.reviewNodes = [];
   state.workzone = null;
+  state.reservations = null;
   state.sorties.forEach((s) => colorFor(s.id));
   // The inputs show the most recent run's attempted thresholds: the solve
   // response echoes THIS run's values; after a reload with a persisted unknown
@@ -844,10 +846,12 @@ async function openBatch(bid) {
     state.warningSorties = {};
     state.review = null;
     state.workzone = null;
+    state.reservations = null;
     renderBatchList();
     renderBatchDetail();
     renderWorkzone();
     await fetchReviewNodes();
+    await fetchReservations();
   } catch (e) {
     toast("载入批次失败：" + e.message);
   }
@@ -874,11 +878,13 @@ async function deleteBatch(bid) {
     state.review = null;
     state.reviewNodes = [];
     state.workzone = null;
+    state.reservations = null;
   }
   toast("批次已删除");
   await fetchBatches();
   renderBatchDetail();
   renderWorkzone();
+  renderReservations();
 }
 
 async function submitReport(sortieId) {
@@ -903,6 +909,9 @@ async function submitReport(sortieId) {
       await evaluateWarning();
       if (hadWorkzoneQuery) await evaluateWorkzone(true);
     }
+    // Reports never revoke a reservation, but their live statuses
+    // (safe/affected/unconfirmable) move with the newest revision.
+    await fetchReservations();
   } catch (e) {
     // Another process may have committed a higher revision concurrently:
     // reload so the page (and auto +1 revision) reflects the winning row.
@@ -1229,6 +1238,94 @@ function renderWorkzone() {
 }
 
 // ---------------------------------------------------------------------------
+// Temporary work-zone reservations
+// ---------------------------------------------------------------------------
+
+async function fetchReservations() {
+  if (!state.batch) return;
+  try {
+    const d = await api(`/api/batches/${state.batch.batch_id}/workzone/reservations`);
+    state.reservations = d.reservations || [];
+  } catch (e) {
+    state.reservations = [];
+  }
+  renderReservations();
+}
+
+function reservationStatusBadge(status) {
+  if (status === "safe") return `<span class="wzr-tag safe">✅ 安全</span>`;
+  if (status === "affected") return `<span class="wzr-tag affected">⚠️ 受影响</span>`;
+  return `<span class="wzr-tag unconfirmable">⛔ 不可确认</span>`;
+}
+
+function renderReservations() {
+  const box = $("wzResBox");
+  if (!box) return;
+  if (!state.reservations) { box.innerHTML = ""; return; }
+  if (!state.reservations.length) {
+    box.innerHTML = `<div class="hint">本批次尚无作业区预约。先查询开工窗口，再选定起点 s 预约。</div>`;
+    return;
+  }
+  box.innerHTML = state.reservations.map((r) => {
+    const z = r.zone;
+    let reason = "";
+    if (r.status === "unconfirmable") {
+      const parts = [];
+      if (r.overdue_sorties && r.overdue_sorties.length)
+        parts.push(`逾期架次：${r.overdue_sorties.map(escapeHtml).join("、")}`);
+      if (r.early_violations && r.early_violations.length)
+        parts.push(`t=${r.t} 早于已报实际起飞：` +
+          r.early_violations.map((v) => `${escapeHtml(v.sortie_id)}@${v.actual_takeoff}s`).join("、"));
+      reason = `<div class="wzr-reason unconf">${parts.join("；") || "航迹不可确认"}</div>`;
+    } else if (r.status === "affected") {
+      const parts = [];
+      if (r.occupancy_conflicts && r.occupancy_conflicts.length)
+        parts.push("最新航迹占用：" + r.occupancy_conflicts.map((o) =>
+          `${escapeHtml(o.sortie_id)} ` +
+          o.occupied_intervals.map((iv) => `[${iv.time_start},${iv.time_end}]`).join("，")).join("；"));
+      if (r.conflicting_reservation_ids && r.conflicting_reservation_ids.length)
+        parts.push(`与预约 ${r.conflicting_reservation_ids.map((id) => `#${id}`).join("、")} 时空相交`);
+      reason = `<div class="wzr-reason aff">${parts.join("；")}</div>`;
+    }
+    return `<div class="wzr-item ${r.status}">
+      <div class="wzr-head">
+        <span class="wzr-id">#${r.reservation_id}</span>
+        ${reservationStatusBadge(r.status)}
+        <span class="wzr-meta">起点 <b>${r.start}</b>s · 作业 [${r.action_interval[0]}, ${r.action_interval[1]}]s · d=${r.duration} · 窗口 t=${r.t},T=${r.T}</span>
+      </div>
+      <div class="wzr-meta">圆柱 中心(${z.center_x}, ${z.center_y}) · r=${z.radius}m · 高度 [${z.z_lo}, ${z.z_hi}]m</div>
+      ${reason}
+    </div>`;
+  }).join("");
+}
+
+async function submitReservation() {
+  if (!state.batch) return;
+  const p = readWorkzoneParams();
+  if (!p) return;
+  const s = parseInt($("wzS").value, 10);
+  if (!Number.isInteger(s) || s < 0) { toast("预约起点 s 必须是非负整数秒"); return; }
+  try {
+    const d = await api(`/api/batches/${state.batch.batch_id}/workzone/reservations`, {
+      method: "POST",
+      body: JSON.stringify({
+        cx: p.cx, cy: p.cy, radius: p.radius,
+        z_lo: p.z_lo, z_hi: p.z_hi, t: p.t, T: p.T, d: p.d, s,
+      }),
+    });
+    const r = d.reservation;
+    toast(`已登记预约 #${r.reservation_id}（起点 ${r.start}s，状态：安全）`);
+    await fetchReservations();
+  } catch (e) {
+    // The server re-adjudicated inside its write transaction against the
+    // newest committed state; refusal leaves no reservation. Reload the list
+    // in case another reservation committed first.
+    toast("预约被拒绝（不留记录）：" + e.message, 4600);
+    await fetchReservations();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -1275,6 +1372,17 @@ $("closeResult").addEventListener("click", () => $("resultPanel").classList.add(
 $("createBatchBtn").addEventListener("click", createBatch);
 $("evalWarnBtn").addEventListener("click", evaluateWarning);
 $("evalWzBtn").addEventListener("click", () => evaluateWorkzone());
+$("wzReserveBtn").addEventListener("click", submitReservation);
+$("wzFillEarliest").addEventListener("click", () => {
+  if (state.workzone && state.workzone.confirmable
+      && Number.isInteger(state.workzone.earliest_safe_start)) {
+    $("wzS").value = state.workzone.earliest_safe_start;
+  } else if (state.workzone && !state.workzone.confirmable) {
+    toast("存在逾期架次，航迹不可确认，无法提供安全起点");
+  } else {
+    toast("请先查询开工窗口并取得安全起点");
+  }
+});
 $("reviewBtn").addEventListener("click", evaluateReview);
 $("warnT").addEventListener("keydown", (e) => { if (e.key === "Enter") evaluateWarning(); });
 $("batchDel").addEventListener("click", () => {

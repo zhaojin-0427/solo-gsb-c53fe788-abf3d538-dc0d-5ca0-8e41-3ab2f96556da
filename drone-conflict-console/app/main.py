@@ -18,6 +18,7 @@ from .schemas import (
     ReportRequest,
     SaveRequest,
     SolveRequest,
+    WorkZoneReservationRequest,
 )
 from .solver import (
     PairConstraint,
@@ -27,6 +28,7 @@ from .solver import (
 )
 from .batch import EarlyTimeReject, Report, evaluate_warning, review_warning
 from .workzone import InvalidWorkZoneQuery, evaluate_workzone
+from .reservation import ReservationRejected, evaluate_reservation_status
 from .storage import BatchRejected, Store
 
 DB_PATH = os.environ.get("DCC_DB_PATH", "data/console.db")
@@ -455,6 +457,118 @@ def batch_workzone(bid: int, cx: float, cy: float, radius: float,
         )
     summary = _batch_summary(row)
     return {**summary, "workzone": result}
+
+
+# ---------------------------------------------------------------------------
+# Temporary work-zone reservations
+# ---------------------------------------------------------------------------
+
+
+def _reservation_dto(sorties, planned_offsets: dict[str, int],
+                     reports: dict[str, Report],
+                     res: dict, others: list[dict]) -> dict:
+    """A stored reservation plus its status re-judged on the LATEST state.
+
+    Later reports never revoke a reservation; its stored parameters are
+    immutable and only ``status`` (safe / affected / unconfirmable) and the
+    reasons move with the newest committed reports/reservations.
+    """
+    live = evaluate_reservation_status(
+        sorties, planned_offsets, reports, res,
+        [o for o in others if o["id"] != res["id"]])
+    return {
+        "reservation_id": res["id"],
+        "batch_id": res["batch_id"],
+        "zone": {
+            "center_x": res["center_x"], "center_y": res["center_y"],
+            "radius": res["radius"], "z_lo": res["z_lo"], "z_hi": res["z_hi"],
+        },
+        "t": res["t"],
+        "T": res["T"],
+        "duration": res["duration"],
+        "start": res["start"],
+        "action_interval": [res["start"], res["start"] + res["duration"]],
+        "created_at": res["created_at"],
+        "status": live["status"],
+        "overdue_sorties": live["overdue_sorties"],
+        "early_violations": live["early_violations"],
+        "occupancy_conflicts": live["occupancy_conflicts"],
+        "conflicting_reservation_ids": live["conflicting_reservation_ids"],
+    }
+
+
+@app.post("/api/batches/{bid}/workzone/reservations", status_code=201)
+def create_workzone_reservation(bid: int, req: WorkZoneReservationRequest):
+    """Register one integer start second for a temporary work action.
+
+    The submission re-adjudicates everything against SQLite's LATEST state
+    INSIDE one ``BEGIN IMMEDIATE`` transaction (the authoritative batch row,
+    every committed report and every registered reservation are read after
+    acquiring the write lock): ``s ∈ [t, T-d]``, ``t`` not preceding a
+    reported actual take-off, no overdue sortie, no continuous-time
+    intersection of the closed action interval with trajectory occupancy, and
+    no space-time intersection with a same-batch reservation (cylinders or
+    times merely touching already conflict).  A report revision or another
+    reservation committing in the query-submission gap therefore can never
+    make an outdated start pass; every refusal is rolled back and leaves no
+    row behind.
+    """
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    sorties, _ = _build_batch(row)
+    try:
+        res = store.create_reservation(
+            sorties, bid,
+            req.cx, req.cy, req.radius, req.z_lo, req.z_hi,
+            req.t, req.T, req.d, req.s)
+    except ReservationRejected as exc:
+        if exc.status_code == 404:
+            raise HTTPException(404, "batch not found")
+        raise HTTPException(exc.status_code,
+                            detail={"reason": exc.reason, **exc.fields})
+    # The insert just committed; under that same state the reservation is by
+    # construction safe - recompute through the shared DTO so page and API
+    # return exactly the reloadable shape.
+    fresh = store.get_batch(bid)
+    sorties, reports = _build_batch(fresh)
+    rows = store.list_reservation_rows(bid)
+    return {"reservation": _reservation_dto(
+        sorties, fresh["plan"]["offsets"], reports,
+        next(r for r in rows if r["id"] == res["id"]), rows)}
+
+
+@app.get("/api/batches/{bid}/workzone/reservations")
+def list_workzone_reservations(bid: int):
+    """List reservations with statuses re-judged on the LATEST reports.
+
+    Later reports never revoke a reservation: one no longer safe is marked
+    ``affected``; one with an overdue sortie or whose submission ``t`` is now
+    earlier than a reported actual take-off is ``unconfirmable``.
+    """
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    sorties, reports = _build_batch(row)
+    rows = store.list_reservation_rows(bid)
+    return {"batch_id": bid,
+            "reservations": [
+                _reservation_dto(sorties, row["plan"]["offsets"], reports,
+                                 r, rows) for r in rows]}
+
+
+@app.get("/api/batches/{bid}/workzone/reservations/{rid}")
+def get_workzone_reservation(bid: int, rid: int):
+    row = store.get_batch(bid)
+    if row is None:
+        raise HTTPException(404, "batch not found")
+    res = store.get_reservation_row(bid, rid)
+    if res is None:
+        raise HTTPException(404, "work-zone reservation not found")
+    sorties, reports = _build_batch(row)
+    rows = store.list_reservation_rows(bid)
+    return {"reservation": _reservation_dto(
+        sorties, row["plan"]["offsets"], reports, res, rows)}
 
 
 def _reports_from_snapshot(snapshot: list[dict]) -> dict[str, Report]:

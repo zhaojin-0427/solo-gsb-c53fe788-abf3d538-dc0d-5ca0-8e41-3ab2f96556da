@@ -105,6 +105,17 @@
             </div>
           </div>
           <div id="wzBox" class="wz-box"></div>
+
+          <div class="wz-res">
+            <div class="rv-title">临时作业区预约</div>
+            <div class="hint">从上方开工窗口中选定一个整数秒起点 s 提交：服务端在<b>同一个写事务</b>内按 SQLite 最新上报重新判定 s∈[t,T−d]、闭作业区间 [s,s+d] 是否避开连续时间圆柱占用，并排除同批次已登记预约的时空相交（圆柱或时间仅边界相触也算冲突）；逾期架次或 t 早于已报实际起飞则拒绝，拒绝不留记录。后续上报不会撤销预约，列表按最新状态把不再安全的标为“受影响”、逾期或 t 早于已报起飞的标为“不可确认”。</div>
+            <div class="wz-grid" style="grid-template-columns:1fr 1fr auto">
+              <label>预约起点 s（整数秒）<input id="wzS" type="number" step="1" value="0" /></label>
+              <label class="wz-fill"><button id="wzFillEarliest" type="button">填入最早安全起点</button></label>
+              <label class="wz-submit"><button id="wzReserveBtn" type="button">预约该起点</button></label>
+            </div>
+            <div id="wzResBox" class="wz-res-list"></div>
+          </div>
         </div>
 
         <div class="rv-block">

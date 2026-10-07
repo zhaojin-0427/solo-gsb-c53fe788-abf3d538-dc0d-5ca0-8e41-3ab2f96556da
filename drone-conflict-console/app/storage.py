@@ -14,6 +14,9 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .batch import Report
+from .reservation import ReservationRejected, adjudicate_reservation
+
 # Serializes writes inside one process; cross-process arbitration is handled
 # by SQLite itself (WAL + a ``BEGIN IMMEDIATE`` write transaction).
 _LOCK = threading.Lock()
@@ -114,6 +117,33 @@ CREATE TABLE IF NOT EXISTS batch_report_nodes (
     created_at              REAL NOT NULL,
     UNIQUE (batch_id, seq)
 );
+
+-- Registered temporary work-zone reservations.  A reservation is a concrete
+-- integer start second ``start`` for a positive-integer ``duration`` work
+-- action inside a closed vertical cylinder, submitted with the current
+-- second ``t`` and deadline second ``T`` that were in force then.  The row is
+-- immutable once inserted: later take-off reports never revoke it; instead
+-- its live status (safe / affected / unconfirmable) is re-computed from the
+-- newest committed reports whenever it is listed or reloaded.  The whole
+-- submission adjudication (latest-state read + trajectory/space-time
+-- conflict checks + this insert) runs in one BEGIN IMMEDIATE transaction, so
+-- a revision committed in the gap or a reservation that commits first can
+-- never make an outdated start pass, and a refusal leaves no row behind.
+CREATE TABLE IF NOT EXISTS workzone_reservations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    center_x        REAL NOT NULL,
+    center_y        REAL NOT NULL,
+    radius          REAL NOT NULL CHECK (radius > 0),
+    z_lo            REAL NOT NULL,
+    z_hi            REAL NOT NULL CHECK (z_hi > z_lo),
+    t               INTEGER NOT NULL CHECK (t >= 0),
+    deadline        INTEGER NOT NULL CHECK (deadline >= t),
+    duration        INTEGER NOT NULL CHECK (duration > 0),
+    start           INTEGER NOT NULL CHECK (start >= t AND start <= deadline - duration),
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wz_res_batch ON workzone_reservations(batch_id, id);
 """
 
 
@@ -303,8 +333,12 @@ class Store:
 
     def delete_scenario(self, scenario_id: int) -> bool:
         with self._write_tx() as c:
-            # Remove dependent batches (and their reports/nodes) explicitly so
-            # the cascade works even on databases created before the FK cascade.
+            # Remove dependent batches (and their reports/nodes/reservations)
+            # explicitly so the cascade works even on databases created before
+            # the FK cascade.
+            c.execute("DELETE FROM workzone_reservations WHERE batch_id IN "
+                      "(SELECT id FROM batches WHERE scenario_id=?)",
+                      (scenario_id,))
             c.execute("DELETE FROM batch_report_nodes WHERE batch_id IN "
                       "(SELECT id FROM batches WHERE scenario_id=?)",
                       (scenario_id,))
@@ -479,6 +513,10 @@ class Store:
 
     def delete_batch(self, batch_id: int) -> bool:
         with self._write_tx() as c:
+            # Explicit removal for databases created before the FK cascade;
+            # the reservations' live status is derived from this batch.
+            c.execute("DELETE FROM workzone_reservations WHERE batch_id=?",
+                      (batch_id,))
             cur = c.execute("DELETE FROM batches WHERE id=?", (batch_id,))
             return cur.rowcount > 0
 
@@ -610,3 +648,102 @@ class Store:
                 "SELECT * FROM batch_report_nodes WHERE batch_id=? AND id=?",
                 (batch_id, node_id)).fetchone()
         return self._node_row(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Temporary work-zone reservations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reservation_row(r) -> dict:
+        return {
+            "id": r["id"],
+            "batch_id": r["batch_id"],
+            "center_x": r["center_x"],
+            "center_y": r["center_y"],
+            "radius": r["radius"],
+            "z_lo": r["z_lo"],
+            "z_hi": r["z_hi"],
+            "t": r["t"],
+            "T": r["deadline"],
+            "duration": r["duration"],
+            "start": r["start"],
+            "created_at": r["created_at"],
+        }
+
+    def _reservation_rows_locked(self, c, batch_id: int) -> list[dict]:
+        rows = c.execute(
+            "SELECT * FROM workzone_reservations WHERE batch_id=? ORDER BY id",
+            (batch_id,)).fetchall()
+        return [self._reservation_row(r) for r in rows]
+
+    def list_reservation_rows(self, batch_id: int) -> list[dict]:
+        with self._conn() as c:
+            return self._reservation_rows_locked(c, batch_id)
+
+    def get_reservation_row(self, batch_id: int,
+                            reservation_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM workzone_reservations "
+                "WHERE batch_id=? AND id=?",
+                (batch_id, reservation_id)).fetchone()
+        return self._reservation_row(row) if row is not None else None
+
+    def create_reservation(self, sorties, batch_id: int,
+                           cx: float, cy: float, radius: float,
+                           z_lo: float, z_hi: float,
+                           t: int, T: int, d: int, s: int) -> dict:
+        """Adjudicate and insert one work-zone reservation atomically.
+
+        The whole decision - read the AUTHORITATIVE batch row and every
+        committed report / registered reservation only after acquiring the
+        write lock, re-judge ``s ∈ [t, T-d]``, the continuous-time
+        trajectory occupancy and same-batch space-time intersections, then
+        insert - happens in ONE ``BEGIN IMMEDIATE`` transaction:
+
+        * a take-off report a client queried before but which commits only in
+          the submission gap is visible to the in-transaction read (report
+          writes take the same write lock and therefore serialize against
+          this transaction), so an outdated/unsafe start can never pass;
+        * two reservations racing for the same cylinder/time queue on the
+          write lock: the loser re-reads the winner's committed row and is
+          refused with its id, so space-time overlap (boundary touches
+          included) can never be both accepted;
+        * every refusal raises :class:`ReservationRejected`, rolls the
+          transaction back and leaves no reservation behind.
+
+        ``sorties`` are the frozen batch trajectories built by the route
+        (the input snapshot cannot change for a frozen batch, so reading it
+        before the transaction is harmless; every state input is read inside).
+        """
+        with self._write_tx() as c:
+            row = c.execute(
+                "SELECT id,plan_json FROM batches WHERE id=?",
+                (batch_id,)).fetchone()
+            if row is None:
+                raise ReservationRejected(404, "batch_not_found")
+            planned_offsets = json.loads(row["plan_json"])["offsets"]
+            reports = {
+                r["sortie_id"]: Report(r["actual_offset"], r["revision"])
+                for r in c.execute(
+                    "SELECT sortie_id,actual_offset,revision "
+                    "FROM batch_reports WHERE batch_id=?",
+                    (batch_id,)).fetchall()
+            }
+            existing = self._reservation_rows_locked(c, batch_id)
+            adjudicate_reservation(
+                sorties, planned_offsets, reports,
+                cx, cy, radius, z_lo, z_hi, t, T, d, s, existing)
+            now = time.time()
+            cur = c.execute(
+                "INSERT INTO workzone_reservations"
+                "(batch_id,center_x,center_y,radius,z_lo,z_hi,t,deadline,"
+                "duration,start,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (batch_id, float(cx), float(cy), float(radius),
+                 float(z_lo), float(z_hi), int(t), int(T),
+                 int(d), int(s), now))
+            rid = int(cur.lastrowid)
+            inserted = c.execute(
+                "SELECT * FROM workzone_reservations WHERE id=?",
+                (rid,)).fetchone()
+            return self._reservation_row(inserted)
